@@ -1,22 +1,29 @@
 from typing import Any
 
-from models import Chunk, Document, Query, RetrievedChunk
+from .models import Chunk, Document, Query, RetrievedChunk
 
 
 def split_text_fixed(text: str, max_chars: int) -> list[str]:
-    '''
+    """
     Split text into fixed-size chunks.
 
     Expected behavior:
     - strip surrounding whitespace
     - return [] for empty text
     - if max_chars <= 0, raise ValueError
-    '''
-    raise NotImplementedError
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be > 0")
+
+    text = text.strip()
+    if not text:
+        return []
+
+    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
 
 
 def chunk_document(document: Document, max_chars: int = 80) -> list[Chunk]:
-    '''
+    """
     Convert a Document into retrieval Chunk objects.
 
     Rules:
@@ -24,19 +31,57 @@ def chunk_document(document: Document, max_chars: int = 80) -> list[Chunk]:
     - skip empty sections
     - split long content using split_text_fixed
     - use deterministic chunk IDs
-    '''
-    raise NotImplementedError
+    """
+    chunks: list[Chunk] = []
+
+    for section in document.sections:
+        content = section.content.strip()
+        if not content:
+            continue
+
+        parts = split_text_fixed(content, max_chars)
+
+        for chunk_index, part in enumerate(parts):
+            chunk_id = f"{document.document_id}:{section.section_type}:{chunk_index}"
+
+            metadata = {
+                **document.metadata,
+                **section.metadata,
+                "source_type": document.source_type,
+                "source_ref": document.source_ref
+            }
+
+            chunk = Chunk(
+                chunk_id=chunk_id,
+                document_id=document.document_id,
+                text=part,
+                section_type=section.section_type,
+                page_number=section.page_number,
+                metadata=metadata
+            )
+
+            chunks.append(chunk)
+
+    return chunks
 
 
 def filter_chunks_by_metadata(
     chunks: list[RetrievedChunk],
     metadata_filter: dict[str, Any] | None,
 ) -> list[RetrievedChunk]:
-    '''
+    """
     Return only chunks that match every key/value pair in metadata_filter.
     If metadata_filter is empty or None, return the input unchanged.
-    '''
-    raise NotImplementedError
+    """
+    if not metadata_filter:
+        return chunks
+
+    filtered = []
+    for chunk in chunks:
+        if all(chunk.metadata.get(key) == value for key, value in metadata_filter.items()):
+            filtered.append(chunk)
+
+    return filtered
 
 
 def hybrid_retrieve(
@@ -47,7 +92,7 @@ def hybrid_retrieve(
     rank_constant: int = 60,
     solution_boost: float = 1.15,
 ) -> list[RetrievedChunk]:
-    '''
+    """
     Fuse dense_results and lexical_results with Reciprocal Rank Fusion.
 
     Requirements:
@@ -58,8 +103,48 @@ def hybrid_retrieve(
     - apply solution_boost after fusion
     - sort by score descending, then chunk_id ascending
     - return at most query.top_k items
-    '''
-    raise NotImplementedError
+    """
+    dense_filtered = filter_chunks_by_metadata(dense_results, query.metadata)
+    lexical_filtered = filter_chunks_by_metadata(lexical_results, query.metadata)
+
+    fused_scores: dict[str, float] = {}
+    chunk_lookup: dict[str, RetrievedChunk] = {}
+
+    for rank_position, chunk in enumerate(dense_filtered, start=1):
+        score = 1 / (rank_constant + rank_position)
+        fused_scores[chunk.chunk_id] = fused_scores.get(chunk.chunk_id, 0) + score
+        if chunk.chunk_id not in chunk_lookup:
+            chunk_lookup[chunk.chunk_id] = chunk
+
+    for rank_position, chunk in enumerate(lexical_filtered, start=1):
+        score = 1 / (rank_constant + rank_position)
+        fused_scores[chunk.chunk_id] = fused_scores.get(chunk.chunk_id, 0) + score
+        if chunk.chunk_id not in chunk_lookup:
+            chunk_lookup[chunk.chunk_id] = chunk
+
+    fused_results: list[RetrievedChunk] = []
+
+    for chunk_id, score in fused_scores.items():
+        original = chunk_lookup[chunk_id]
+
+        if original.section_type == "solution":
+            score *= solution_boost
+
+        fused_results.append(
+            RetrievedChunk(
+                chunk_id=original.chunk_id,
+                document_id=original.document_id,
+                text=original.text,
+                score=score,
+                section_type=original.section_type,
+                page_number=original.page_number,
+                metadata=original.metadata
+            )
+        )
+
+    fused_results.sort(key=lambda c: (-c.score, c.chunk_id))
+
+    return fused_results[: query.top_k]
 
 
 def build_answer_payload(
@@ -67,12 +152,44 @@ def build_answer_payload(
     retrieved_chunks: list[RetrievedChunk],
     max_citation_chunks: int = 3,
 ) -> dict[str, Any]:
-    '''
+    """
     Build a response payload with:
     - answer
     - citations
     - metadata
 
     Do not call any external model.
-    '''
-    raise NotImplementedError
+    """
+    if not retrieved_chunks:
+        return {
+            "answer": "I could not find relevant support content.",
+            "citations": [],
+            "metadata": {
+                "query": query.text,
+                "result_count": 0
+            }
+        }
+
+    top_chunks = retrieved_chunks[:max_citation_chunks]
+    answer = " ".join(chunk.text for chunk in top_chunks).strip()
+
+    citations = [
+        {
+            "chunk_id": chunk.chunk_id,
+            "document_id": chunk.document_id,
+            "section_type": chunk.section_type,
+            "page_number": chunk.page_number,
+            "source_type": chunk.metadata.get("source_type"),
+            "source_ref": chunk.metadata.get("source_ref")
+        }
+        for chunk in top_chunks
+    ]
+
+    return {
+        "answer": answer,
+        "citations": citations,
+        "metadata": {
+            "query": query.text,
+            "result_count": len(retrieved_chunks)
+        }
+    }
